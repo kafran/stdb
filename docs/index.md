@@ -1,0 +1,1 @@
+# Synapse External Tables Databricks

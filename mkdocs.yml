@@ -1,0 +1,6 @@
+site_name: stdb
+repo_url: https://github.com/kafran/stdb
+repo_name: kafran/stdb
+edit_uri: tree/main/docs
+theme:
+  name: material
