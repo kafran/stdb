@@ -6,7 +6,7 @@ authors = ["Kolmar Kafran <kolmar@kafran.net>"]
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = "3.12.*"
+python = "3.10.*"
 pyspark = "^3.5.1"
 azure-identity = "^1.17.1"
 databricks-sdk = "^0.29.0"
