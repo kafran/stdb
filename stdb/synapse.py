@@ -1,11 +1,14 @@
 import typing as t
 import urllib.parse
 import uuid
+from bisect import bisect
 from collections import namedtuple
 from contextlib import closing, contextmanager
 from enum import Enum
+from operator import attrgetter
 from urllib.parse import urljoin, urlunparse
 
+import pyspark.sql.functions as F
 from azure.identity import ClientSecretCredential
 from databricks.sdk.runtime import dbutils
 
@@ -23,6 +26,10 @@ JDBCConnection = JDBCStatement = JDBCResultSet = t.Any
 class FileType(Enum):
     PARQUET = "PARQUET"
     DELTA = "DELTA"
+
+
+Length = namedtuple("Length", ("x", "length"))
+by_length = attrgetter("length")
 
 
 class Synapse:
@@ -55,6 +62,10 @@ class Synapse:
             "fs.azure.account.oauth2.client.secret": f"{client_secret}",
             "fs.azure.account.oauth2.client.endpoint": f"https://login.microsoftonline.com/{tenant_id}/oauth2/token",
         }
+        self._VARCHAR_THRESHOLD = (
+            [Length(f"varchar({i})", i) for i in range(100, 1100, 100)] + 
+            [Length(f"varchar({i})", i) for i in range(2000, 10000, 2000)]
+        )  # fmt: skip
 
     @property
     def token(self):
@@ -188,6 +199,16 @@ class Synapse:
                     return data
             return {}  # TODO: Maybe throw?
 
+    def _find_varchar_size(self, length):
+        threshold = self._VARCHAR_THRESHOLD
+        if length < 50:
+            return "varchar(50)"
+        idx = bisect(threshold, length, key=by_length)
+        if idx == len(threshold):
+            return "varchar(max)"
+        else:
+            return threshold[idx].x
+
     def create_external_table(
         self,
         storage_account,
@@ -232,8 +253,24 @@ class Synapse:
 
             with self.synapse_jdbc_connection() as con:
                 for f in parquet_files:
-                    file_url = urljoin(adls_url, f.name)
-                    synapse_schema = self.infer_synapse_schema(con, file_url)
+                    file_adls_url = urljoin(adls_url, f.name)
+                    synapse_schema = self.infer_synapse_schema(con, file_adls_url)
+                    varchar_cols = {
+                        col: f"`{col}`"  # escape col name for spark read in case of special characters
+                        for col, type in synapse_schema.items()
+                        if "varchar" in type
+                    }
+                    df = self.spark.read.parquet(f.path).select(*varchar_cols.values())
+                    max_length_df = df.select(
+                        [
+                            F.max(F.length(F.col(escape_col))).alias(col)
+                            for col, escape_col in varchar_cols.items()
+                        ]
+                    )
+                    max_lengths = [Length(*i) for i in max_length_df.collect()[0].asDict().items()]  # fmt: skip
+                    max_lengths.sort(key=by_length)
+                    varchar_sizes = {col.x: self._find_varchar_size(col.length) for col in max_lengths}  # fmt: skip
+                    synapse_schema |= varchar_sizes
                     parquet_files[f].schema.update(synapse_schema)
 
             return parquet_files
