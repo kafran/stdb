@@ -28,7 +28,9 @@ class FileType(Enum):
     DELTA = "DELTA"
 
 
-Length = namedtuple("Length", ("x", "length"))
+AdlsTable = namedtuple("AdlsTable", ("url", "schema"))
+VarcharSize = namedtuple("VarcharSize", ("varchar_size", "length"))
+ColumnLength = namedtuple("ColumnLength", ("column_name", "length"))
 by_length = attrgetter("length")
 
 
@@ -63,8 +65,8 @@ class Synapse:
             "fs.azure.account.oauth2.client.endpoint": f"https://login.microsoftonline.com/{tenant_id}/oauth2/token",
         }
         self._VARCHAR_THRESHOLD = (
-            [Length(f"varchar({i})", i) for i in range(100, 1100, 100)] + 
-            [Length(f"varchar({i})", i) for i in range(2000, 10000, 2000)]
+            [VarcharSize(f"varchar({i})", i) for i in range(100, 1100, 100)] + 
+            [VarcharSize(f"varchar({i})", i) for i in range(2000, 10000, 2000)]
         )  # fmt: skip
 
     @property
@@ -207,7 +209,47 @@ class Synapse:
         if idx == len(threshold):
             return "varchar(max)"
         else:
-            return threshold[idx].x
+            return threshold[idx].varchar_size
+
+    def infer_varchar_size(self, schema): ...
+
+    def get_adls_tables(
+        self,
+        container: str,
+        storage_account: str,
+        path: str,
+    ) -> list[AdlsTable]:
+        adls_url = self.build_adls_url(container, storage_account, path)
+        with self.dbfs_mount(adls_url) as mount_point:
+            files = dbutils.fs.ls(mount_point)
+            adls_files = {}
+            for file in files:
+                # TODO: Add support for Delta Tables
+                if file.name.endswith(".parquet"):
+                    table_url = urljoin(adls_url, file.name)
+                    adls_files[file] = AdlsTable(url=table_url, schema={})
+
+            with self.synapse_jdbc_connection() as con:
+                for file, table in adls_files.items():
+                    synapse_schema = self.infer_synapse_schema(con, table.url)
+                    varchar_cols = {
+                        col: f"`{col}`"  # escape col name for spark read in case of special characters
+                        for col, type in synapse_schema.items()
+                        if "varchar" in type
+                    }
+                    df = self.spark.read.parquet(file.path).select(*varchar_cols.values())
+                    max_length_df = df.select(
+                        [
+                            F.max(F.length(F.col(escape_col))).alias(col)
+                            for col, escape_col in varchar_cols.items()
+                        ]
+                    )
+                    max_lengths = [ColumnLength(*i) for i in max_length_df.collect()[0].asDict().items()]  # fmt: skip
+                    max_lengths.sort(key=by_length)
+                    varchar_sizes = {col.column_name: self._find_varchar_size(col.length) for col in max_lengths}  # fmt: skip
+                    synapse_schema.update(varchar_sizes)
+                    table.schema.update(synapse_schema)
+        return list(adls_files.values())
 
     def create_external_table(
         self,
@@ -243,34 +285,8 @@ class Synapse:
         """
         if not path.endswith("/"):
             # TODO: Define error types
-            raise ValueError("Path must point to a folder on Azure Data Lake Store Gen2")
-        FileDetails = namedtuple("FileDetails", ["schema", "df"], defaults=({}, None))
-        adls_url = self.build_adls_url(container, storage_account, path)
-        # TODO: Add support for Delta Tables
-        with self.dbfs_mount(adls_url) as mount_point:
-            files = dbutils.fs.ls(mount_point)
-            parquet_files = {f: FileDetails() for f in files if f.name.endswith(".parquet")}  # fmt: skip
+            raise ValueError("""Path must ends with "/" and point to a folder (database) on Azure Data Lake Store Gen2""")  # fmt: skip
 
-            with self.synapse_jdbc_connection() as con:
-                for f in parquet_files:
-                    file_adls_url = urljoin(adls_url, f.name)
-                    synapse_schema = self.infer_synapse_schema(con, file_adls_url)
-                    varchar_cols = {
-                        col: f"`{col}`"  # escape col name for spark read in case of special characters
-                        for col, type in synapse_schema.items()
-                        if "varchar" in type
-                    }
-                    df = self.spark.read.parquet(f.path).select(*varchar_cols.values())
-                    max_length_df = df.select(
-                        [
-                            F.max(F.length(F.col(escape_col))).alias(col)
-                            for col, escape_col in varchar_cols.items()
-                        ]
-                    )
-                    max_lengths = [Length(*i) for i in max_length_df.collect()[0].asDict().items()]  # fmt: skip
-                    max_lengths.sort(key=by_length)
-                    varchar_sizes = {col.x: self._find_varchar_size(col.length) for col in max_lengths}  # fmt: skip
-                    synapse_schema |= varchar_sizes
-                    parquet_files[f].schema.update(synapse_schema)
+        adls_tables = self.get_adls_tables(container, storage_account, path)
 
-            return parquet_files
+        return adls_tables
