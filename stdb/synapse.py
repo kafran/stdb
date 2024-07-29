@@ -241,7 +241,10 @@ class Synapse:
                     df = self.spark.read.parquet(file.path).select(*varchar_cols.values())
                     max_length_df = df.select(
                         [
-                            F.max(F.length(F.col(escape_col))).alias(col)
+                            F.coalesce(
+                                F.max(F.length(F.col(escape_col))),
+                                F.lit(0),  # treat null as zero
+                            ).alias(col)
                             for col, escape_col in varchar_cols.items()
                         ]
                     )
