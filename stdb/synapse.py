@@ -1,26 +1,27 @@
-import typing as t
-import urllib.parse
+import re
+import typing as T
+import unicodedata
+import urllib.parse as P
 import uuid
 from bisect import bisect
 from collections import namedtuple
 from contextlib import closing, contextmanager
 from enum import Enum
 from operator import attrgetter
-from urllib.parse import urljoin, urlunparse
 
 import pyspark.sql.functions as F
 from azure.identity import ClientSecretCredential
 from databricks.sdk.runtime import dbutils
 
-if t.TYPE_CHECKING:
+if T.TYPE_CHECKING:
     from pyspark.sql import SparkSession
 
 # Add Azure Data Lake Store scheme to urllib.parse
 ADLS_SCHEME = "abfss"
-urllib.parse.uses_relative.append(ADLS_SCHEME)
-urllib.parse.uses_netloc.append(ADLS_SCHEME)
+P.uses_relative.append(ADLS_SCHEME)
+P.uses_netloc.append(ADLS_SCHEME)
 
-JDBCConnection = JDBCStatement = JDBCResultSet = t.Any
+JDBCConnection = JDBCStatement = JDBCResultSet = T.Any
 
 
 class FileType(Enum):
@@ -155,12 +156,12 @@ class Synapse:
             finally:
                 result_set.close()
 
-    def build_adls_url(self, container: str, storage_account: str, path: str):
-        return urlunparse(
+    def build_adls_url(self, container: str, storage_account: str, path=""):
+        return P.urlunparse(
             (
                 ADLS_SCHEME,  # scheme
                 f"{container}@{storage_account}.dfs.core.windows.net",  # netloc
-                f"{path}",  # path
+                path,  # path
                 "",  # params
                 "",  # query
                 "",  # fragment
@@ -226,7 +227,7 @@ class Synapse:
             for file in files:
                 # TODO: Add support for Delta Tables
                 if file.name.endswith(".parquet"):
-                    table_url = urljoin(adls_url, file.name)
+                    table_url = P.urljoin(adls_url, file.name)
                     adls_files[file] = AdlsTable(url=table_url, schema={})
 
             with self.synapse_jdbc_connection() as con:
@@ -250,6 +251,78 @@ class Synapse:
                     synapse_schema.update(varchar_sizes)
                     table.schema.update(synapse_schema)
         return list(adls_files.values())
+
+    def _generate_data_source_name(self, url):
+        parsed_url = P.urlparse(url)
+        return parsed_url.netloc.replace("@", "_").replace(".", "_")
+
+    def _generate_file_format_name(self, format: FileType):
+        return f"Synapse{format.name.capitalize()}Format"
+
+    def _normalize_table_name(self, text):
+        if text.endswith(".parquet"):
+            text = text[:-8]
+        text = unicodedata.normalize("NFKD", text).encode("ASCII", "ignore").decode("utf-8")  # fmt:skip
+        # Remove special characters
+        text = re.sub(r"[^a-zA-Z0-9]", " ", text)
+        # Convert CamelCase to snake_case
+        text = re.sub("(.)([A-Z][a-z]+)", r"\1_\2", text)
+        text = re.sub("([a-z0-9])([A-Z])", r"\1_\2", text)
+        # Convert to lower case
+        text = text.lower()
+        # Replace spaces with underscores
+        text = re.sub(r"\s+", "_", text)
+        # Remove consecutive underscores
+        text = re.sub(r"_+", "_", text)
+        return text
+
+    def sql_to_create_file_format(self, type: FileType):
+        file_format = self._generate_file_format_name(format=type)
+        CREATE_FILE_FORMAT_TEMPL = (
+            f"IF NOT EXISTS (SELECT * FROM sys.external_file_formats WHERE name = '{file_format}') "
+            f"CREATE EXTERNAL FILE FORMAT [{file_format}] "
+            f"WITH (FORMAT_TYPE = {type.value});"
+        )
+        return CREATE_FILE_FORMAT_TEMPL
+
+    def sql_to_create_data_source(self, url):
+        data_source = self._generate_data_source_name(url)
+        CREATE_DATA_SOURCE_TEMPL = (
+            f"IF NOT EXISTS (SELECT * FROM sys.external_data_sources WHERE name = '{data_source}') "
+            f"CREATE EXTERNAL DATA SOURCE [{data_source}] "
+            f"WITH (LOCATION = '{url}');"
+        )
+        return CREATE_DATA_SOURCE_TEMPL
+
+    def sql_to_create_schema(self, db_schema: str):
+        CREATE_SCHEMA_TEMPL = (
+            f"IF NOT EXISTS (SELECT * FROM sys.schemas WHERE name = '{db_schema}') "
+            "BEGIN "
+            f"EXEC('CREATE SCHEMA {db_schema}'); "
+            "END"
+        )
+        return CREATE_SCHEMA_TEMPL
+
+    # TODO: Add support for Delta Tables
+    def sql_to_create_external_table(self, db_schema, table: AdlsTable):
+        data_source = self._generate_data_source_name(table.url)
+        file_format = self._generate_file_format_name(format=FileType.PARQUET)
+        fields = ", ".join(
+            [
+                f"[{column_name}] {column_type}"
+                for column_name, column_type in table.schema.items()
+            ]
+        )
+        parsed_url = P.urlparse(table.url)
+        table_name = self._normalize_table_name(parsed_url.path.split("/")[-1])
+        CREATE_TABLE_TEMPL = (
+            f"CREATE EXTERNAL TABLE {db_schema}.{table_name} "
+            f"({fields})"
+            f"WITH (LOCATION = '{parsed_url.path}', "
+            f"DATA_SOURCE = [{data_source}], "
+            f"FILE_FORMAT = [{file_format}]);"
+        )
+        return CREATE_TABLE_TEMPL
 
     def create_external_table(
         self,
@@ -289,4 +362,23 @@ class Synapse:
 
         adls_tables = self.get_adls_tables(container, storage_account, path)
 
-        return adls_tables
+        with self.synapse_jdbc_connection() as con:
+            # Set the database on Synapse
+            with self.jdbc_statement(con) as stmt:
+                stmt.execute(f"USE {synapse_db};")
+            # Create the schema if not exist
+            with self.jdbc_statement(con) as stmt:
+                stmt.execute(self.sql_to_create_schema(synapse_schema))
+            # Create the data source if not exist
+            with self.jdbc_statement(con) as stmt:
+                data_source = self.build_adls_url(container, storage_account)
+                stmt.execute(self.sql_to_create_data_source(data_source))
+            # Create the file format if not exist
+            with self.jdbc_statement(con) as stmt:
+                stmt.execute(self.sql_to_create_file_format(FileType.PARQUET))
+            # Create the external tables
+            for table in adls_tables:
+                with self.jdbc_statement(con) as stmt:
+                    stmt.execute(self.sql_to_create_external_table(synapse_schema, table))
+
+        # return adls_tables
