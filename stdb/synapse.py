@@ -282,7 +282,7 @@ class Synapse:
     def sql_to_create_file_format(self, type: FileType):
         file_format = self._generate_file_format_name(format=type)
         CREATE_FILE_FORMAT_TEMPL = (
-            f"IF NOT EXISTS (SELECT * FROM sys.external_file_formats WHERE name = '{file_format}') "
+            f"IF NOT EXISTS (SELECT 1 FROM sys.external_file_formats WHERE name = '{file_format}') "
             f"CREATE EXTERNAL FILE FORMAT [{file_format}] "
             f"WITH (FORMAT_TYPE = {type.value});"
         )
@@ -291,7 +291,7 @@ class Synapse:
     def sql_to_create_data_source(self, url):
         data_source = self._generate_data_source_name(url)
         CREATE_DATA_SOURCE_TEMPL = (
-            f"IF NOT EXISTS (SELECT * FROM sys.external_data_sources WHERE name = '{data_source}') "
+            f"IF NOT EXISTS (SELECT 1 FROM sys.external_data_sources WHERE name = '{data_source}') "
             f"CREATE EXTERNAL DATA SOURCE [{data_source}] "
             f"WITH (LOCATION = '{url}');"
         )
@@ -299,7 +299,7 @@ class Synapse:
 
     def sql_to_create_schema(self, db_schema: str):
         CREATE_SCHEMA_TEMPL = (
-            f"IF NOT EXISTS (SELECT * FROM sys.schemas WHERE name = '{db_schema}') "
+            f"IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = '{db_schema}') "
             "BEGIN "
             f"EXEC('CREATE SCHEMA {db_schema}'); "
             "END"
@@ -307,7 +307,7 @@ class Synapse:
         return CREATE_SCHEMA_TEMPL
 
     # TODO: Add support for Delta Tables
-    def sql_to_create_external_table(self, db_schema, table: AdlsTable):
+    def sql_to_create_external_table(self, db_schema: str, table: AdlsTable):
         data_source = self._generate_data_source_name(table.url)
         file_format = self._generate_file_format_name(format=FileType.PARQUET)
         fields = ", ".join(
@@ -327,6 +327,18 @@ class Synapse:
         )
         return CREATE_TABLE_TEMPL
 
+    def sql_to_drop_existing_table(self, db_schema: str, table: AdlsTable):
+        parsed_url = P.urlparse(table.url)
+        table_name = self._normalize_table_name(parsed_url.path.split("/")[-1])
+        DROP_EXISTING_TABLE_TEMPL = (
+            f"IF EXISTS (SELECT 1 FROM sys.external_tables WHERE name = '{table_name}' "
+            f"AND schema_id = SCHEMA_ID('{db_schema}')) "
+            "BEGIN "
+            f"DROP EXTERNAL TABLE [{db_schema}].[{table_name}]; "
+            "END"
+        )
+        return DROP_EXISTING_TABLE_TEMPL
+
     def create_external_table(
         self,
         storage_account,
@@ -334,6 +346,7 @@ class Synapse:
         path,
         synapse_db,
         synapse_schema="dbo",
+        drop_existing_table=True,
     ):
         """
         Creates an external table in Azure Synapse from Parquet files
@@ -381,6 +394,9 @@ class Synapse:
                 stmt.execute(self.sql_to_create_file_format(FileType.PARQUET))
             # Create the external tables
             for table in adls_tables:
+                if drop_existing_table:
+                    with self.jdbc_statement(con) as stmt:
+                        stmt.execute(self.sql_to_drop_existing_table(synapse_schema, table))  # fmt:skip
                 with self.jdbc_statement(con) as stmt:
                     stmt.execute(self.sql_to_create_external_table(synapse_schema, table))
 
