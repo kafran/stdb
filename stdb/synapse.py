@@ -212,8 +212,6 @@ class Synapse:
         else:
             return threshold[idx].varchar_size
 
-    def infer_varchar_size(self, schema): ...
-
     def get_adls_tables(
         self,
         container: str,
@@ -269,8 +267,9 @@ class Synapse:
         # Remove special characters
         text = re.sub(r"[^a-zA-Z0-9]", " ", text)
         # Convert CamelCase to snake_case
-        text = re.sub("(.)([A-Z][a-z]+)", r"\1_\2", text)
         text = re.sub("([a-z0-9])([A-Z])", r"\1_\2", text)
+        text = text.title()
+        text = re.sub("(.)([A-Z][a-z]+)", r"\1_\2", text)
         # Convert to lower case
         text = text.lower()
         # Replace spaces with underscores
