@@ -231,6 +231,9 @@ class Synapse:
             with self.synapse_jdbc_connection() as con:
                 for file, table in adls_files.items():
                     synapse_schema = self.infer_synapse_schema(con, table.url)
+                    for col, type in synapse_schema.items():
+                        if "varbinary" in type:
+                            synapse_schema[col] = "varbinary(max)"
                     varchar_cols = {
                         col: f"`{col}`"  # escape col name for spark read in case of special characters
                         for col, type in synapse_schema.items()
