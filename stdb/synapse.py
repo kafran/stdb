@@ -236,6 +236,9 @@ class Synapse:
                         for col, type in synapse_schema.items()
                         if "varchar" in type
                     }
+                    if not varchar_cols:
+                        table.schema.update(synapse_schema)
+                        continue
                     df = self.spark.read.parquet(file.path).select(*varchar_cols.values())
                     max_length_df = df.select(
                         [
@@ -319,7 +322,7 @@ class Synapse:
         table_name = self._normalize_table_name(parsed_url.path.split("/")[-1])
         CREATE_TABLE_TEMPL = (
             f"CREATE EXTERNAL TABLE {db_schema}.{table_name} "
-            f"({fields})"
+            f"({fields}) "
             f"WITH (LOCATION = '{parsed_url.path}', "
             f"DATA_SOURCE = [{data_source}], "
             f"FILE_FORMAT = [{file_format}]);"
