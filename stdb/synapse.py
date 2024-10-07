@@ -224,8 +224,8 @@ class Synapse:
             adls_files = {}
             for file in files:
                 # TODO: Add support for Delta Tables
-                if file.name.endswith(".parquet"):
-                    table_url = P.urljoin(adls_url, file.name)
+                if file.name.endswith(".parquet") or file.name.endswith(".parquet/"):
+                    table_url = P.urljoin(adls_url, file.name.rstrip("/"))
                     adls_files[file] = AdlsTable(url=table_url, schema={})
 
             with self.synapse_jdbc_connection() as con:
