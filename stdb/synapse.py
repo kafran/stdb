@@ -29,7 +29,7 @@ class FileType(Enum):
     DELTA = "DELTA"
 
 
-AdlsTable = namedtuple("AdlsTable", ("url", "schema"))
+AdlsTable = namedtuple("AdlsTable", ("file", "schema"))
 VarcharSize = namedtuple("VarcharSize", ("varchar_size", "length"))
 ColumnLength = namedtuple("ColumnLength", ("column_name", "length"))
 by_length = attrgetter("length")
@@ -73,43 +73,6 @@ class Synapse:
     @property
     def token(self):
         return self.credential.get_token("https://database.windows.net/.default").token
-
-    def _generate_mount_point(self):
-        hex = uuid.uuid4().hex[:8]
-        return f"/mnt/stdb_{hex}"
-
-    @contextmanager
-    def dbfs_mount(self, source):
-        """
-        Context manager to handle DBFS mount and unmount operations.
-
-        Args:
-            source (str): The DBFS source to mount.
-
-        Yields:
-            str: The mount point of the DBFS source.
-
-        This function checks if the specified DBFS source is already
-        mounted. If not, it mounts the source to a new mount point. The
-        mount point is yielded for use within the context. Upon exiting
-        the context, the function unmounts the source if it was newly
-        mounted.
-        """
-        try:
-            mounts = dbutils.fs.mounts()
-            mount_point = next((m.mountPoint for m in mounts if m.source == source), None)
-            new_mount_point = None
-            if not mount_point:
-                mount_point = new_mount_point = self._generate_mount_point()
-                dbutils.fs.mount(
-                    source=source,
-                    mount_point=mount_point,
-                    extra_configs=self._DBFS_MOUNT_CONFIG,
-                )
-            yield mount_point
-        finally:
-            if new_mount_point:
-                dbutils.fs.unmount(new_mount_point)
 
     @contextmanager
     def synapse_jdbc_connection(self) -> JDBCConnection:
@@ -212,36 +175,44 @@ class Synapse:
         else:
             return threshold[idx].varchar_size
 
+    # TODO: Add support for Delta Tables
     def get_adls_tables(
         self,
         container: str,
         storage_account: str,
         path: str,
     ) -> list[AdlsTable]:
+        path = path.rstrip("/")
         adls_url = self.build_adls_url(container, storage_account, path)
-        with self.dbfs_mount(adls_url) as mount_point:
-            files = dbutils.fs.ls(mount_point)
-            adls_files = {}
-            for file in files:
-                # TODO: Add support for Delta Tables
-                if file.name.endswith(".parquet") or file.name.endswith(".parquet/"):
-                    table_url = P.urljoin(adls_url, file.name.rstrip("/"))
-                    adls_files[file] = AdlsTable(url=table_url, schema={})
-
+        try:
+            files = dbutils.fs.ls(adls_url)
+        except Exception as e:
+            if "java.io.FileNotFoundException" in str(e):
+                raise ValueError("""java.io.FileNotFoundException at {adls_url}""")  # fmt: skip
+        if path.endswith(".parquet"):
+            if len(files) > 1:
+                filename = path.split("/")[-1]
+                path = "/".join(path.split("/")[:-1])
+                adls_url = self.build_adls_url(container, storage_account, path)
+                files = dbutils.fs.ls(adls_url)
+                files = [file for file in files if file.name == f"{filename}/"]
+        adls_tables = []
+        for file in files:
+            table = AdlsTable(file=file, schema={})
             with self.synapse_jdbc_connection() as con:
-                for file, table in adls_files.items():
-                    synapse_schema = self.infer_synapse_schema(con, table.url)
-                    for col, type in synapse_schema.items():
-                        if "varbinary" in type:
-                            synapse_schema[col] = "varbinary(max)"
-                    varchar_cols = {
-                        col: f"`{col}`"  # escape col name for spark read in case of special characters
-                        for col, type in synapse_schema.items()
-                        if "varchar" in type
-                    }
-                    if not varchar_cols:
-                        table.schema.update(synapse_schema)
-                        continue
+                synapse_schema = self.infer_synapse_schema(con, file.path)
+                for col, type in synapse_schema.items():
+                    if "varbinary" in type:
+                        synapse_schema[col] = "varbinary(max)"
+                varchar_cols = {
+                    col: f"`{col}`"  # escape col name for spark read in case of special characters
+                    for col, type in synapse_schema.items()
+                    if "varchar" in type
+                }
+                if not varchar_cols:
+                    table.schema.update(synapse_schema)
+                    continue
+                try:
                     df = self.spark.read.parquet(file.path).select(*varchar_cols.values())
                     max_length_df = df.select(
                         [
@@ -257,7 +228,10 @@ class Synapse:
                     varchar_sizes = {col.column_name: self._find_varchar_size(col.length) for col in max_lengths}  # fmt: skip
                     synapse_schema.update(varchar_sizes)
                     table.schema.update(synapse_schema)
-        return list(adls_files.values())
+                    adls_tables.append(table)
+                except Exception as e:
+                    raise Exception(f"Error processing file: {file.path}") from e
+        return adls_tables
 
     def _generate_data_source_name(self, url):
         parsed_url = P.urlparse(url)
@@ -313,7 +287,7 @@ class Synapse:
 
     # TODO: Add support for Delta Tables
     def sql_to_create_external_table(self, db_schema: str, table: AdlsTable):
-        data_source = self._generate_data_source_name(table.url)
+        data_source = self._generate_data_source_name(table.file.path)
         file_format = self._generate_file_format_name(format=FileType.PARQUET)
         fields = ", ".join(
             [
@@ -321,8 +295,10 @@ class Synapse:
                 for column_name, column_type in table.schema.items()
             ]
         )
-        parsed_url = P.urlparse(table.url)
-        table_name = self._normalize_table_name(parsed_url.path.split("/")[-1])
+        parsed_url = P.urlparse(table.file.path)
+        table_name = self._normalize_table_name(
+            parsed_url.path.rstrip("/").split("/")[-1]
+        )
         CREATE_TABLE_TEMPL = (
             f"CREATE EXTERNAL TABLE {db_schema}.{table_name} "
             f"({fields}) "
@@ -333,8 +309,10 @@ class Synapse:
         return CREATE_TABLE_TEMPL
 
     def sql_to_drop_existing_table(self, db_schema: str, table: AdlsTable):
-        parsed_url = P.urlparse(table.url)
-        table_name = self._normalize_table_name(parsed_url.path.split("/")[-1])
+        parsed_url = P.urlparse(table.file.path)
+        table_name = self._normalize_table_name(
+            parsed_url.path.rstrip("/").split("/")[-1]
+        )
         DROP_EXISTING_TABLE_TEMPL = (
             f"IF EXISTS (SELECT 1 FROM sys.external_tables WHERE name = '{table_name}' "
             f"AND schema_id = SCHEMA_ID('{db_schema}')) "
@@ -377,10 +355,6 @@ class Synapse:
             synapse_db="mysynapsedb"
         )
         """
-        if not path.endswith("/"):
-            # TODO: Define error types
-            raise ValueError("""Path must ends with "/" and point to a folder (database) on Azure Data Lake Store Gen2""")  # fmt: skip
-
         adls_tables = self.get_adls_tables(container, storage_account, path)
 
         with self.synapse_jdbc_connection() as con:
@@ -404,5 +378,3 @@ class Synapse:
                         stmt.execute(self.sql_to_drop_existing_table(synapse_schema, table))  # fmt:skip
                 with self.jdbc_statement(con) as stmt:
                     stmt.execute(self.sql_to_create_external_table(synapse_schema, table))
-
-        # return adls_tables
