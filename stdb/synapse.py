@@ -188,7 +188,9 @@ class Synapse:
             files = dbutils.fs.ls(adls_url)
         except Exception as e:
             if "java.io.FileNotFoundException" in str(e):
-                raise ValueError("""java.io.FileNotFoundException at {adls_url}""")  # fmt: skip
+                raise ValueError(f"""java.io.FileNotFoundException at {adls_url}""")  # fmt: skip
+            else:
+                raise
         if path.endswith(".parquet"):
             if len(files) > 1:
                 filename = path.split("/")[-1]
@@ -211,6 +213,7 @@ class Synapse:
                 }
                 if not varchar_cols:
                     table.schema.update(synapse_schema)
+                    adls_tables.append(table)
                     continue
                 try:
                     df = self.spark.read.parquet(file.path).select(*varchar_cols.values())
