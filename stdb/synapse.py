@@ -43,8 +43,15 @@ class Synapse:
         client_id,
         client_secret,
         synapse_workspace,
+        storage_account,
     ):
         self.spark = spark_session
+        self.storage_account = storage_account
+        self.spark.conf.set(f"fs.azure.account.auth.type.{storage_account}.dfs.core.windows.net", "OAuth")  # fmt: skip
+        self.spark.conf.set(f"fs.azure.account.oauth.provider.type.{storage_account}.dfs.core.windows.net", "org.apache.hadoop.fs.azurebfs.oauth2.ClientCredsTokenProvider")  # fmt: skip
+        self.spark.conf.set(f"fs.azure.account.oauth2.client.id.{storage_account}.dfs.core.windows.net", f"{client_id}")  # fmt: skip
+        self.spark.conf.set(f"fs.azure.account.oauth2.client.secret.{storage_account}.dfs.core.windows.net", f"{client_secret}")  # fmt: skip
+        self.spark.conf.set(f"fs.azure.account.oauth2.client.endpoint.{storage_account}.dfs.core.windows.net", f"https://login.microsoftonline.com/{tenant_id}/oauth2/token")  # fmt: skip
         self.credential = ClientSecretCredential(
             tenant_id,
             client_id,
@@ -58,13 +65,6 @@ class Synapse:
             ";hostNameInCertificate=*.sql.azuresynapse.net"
             ";loginTimeout=30"
         )
-        self._DBFS_MOUNT_CONFIG = {
-            "fs.azure.account.auth.type": "OAuth",
-            "fs.azure.account.oauth.provider.type": "org.apache.hadoop.fs.azurebfs.oauth2.ClientCredsTokenProvider",
-            "fs.azure.account.oauth2.client.id": f"{client_id}",
-            "fs.azure.account.oauth2.client.secret": f"{client_secret}",
-            "fs.azure.account.oauth2.client.endpoint": f"https://login.microsoftonline.com/{tenant_id}/oauth2/token",
-        }
         self._VARCHAR_THRESHOLD = (
             [VarcharSize(f"varchar({i})", i) for i in range(100, 1100, 100)] + 
             [VarcharSize(f"varchar({i})", i) for i in range(2000, 10000, 2000)]
